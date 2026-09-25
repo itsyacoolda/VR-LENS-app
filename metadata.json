@@ -1,0 +1,6 @@
+{
+  "name": "VR Lens SBS",
+  "description": "Real-time Side-by-Side (SBS) VR screen overlay and cinema suite for mobile VR headsets like Gear VR and Cardboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
