@@ -172,11 +172,11 @@ fun GearVrGuideScreen(
                 stepNumber = "4",
                 icon = Icons.Default.Gamepad,
                 iconColor = Color(0xFFFF9100),
-                title = "Touching & Controlling Apps in Headset",
-                description = "Why touches can feel blocked: Android 12+ on Galaxy S23+ blocks touches through overlays by default ('Block untrusted touches'). Here is how to control your apps:\n\n" +
-                        "• Method 1 (Instant Touch): Tap '👆 TOUCH APP' on the floating controller pill anytime to instantly hide the overlay and interact freely with your app, then tap 'Return to VR'!\n" +
-                        "• Method 2 (Direct Touch Passing): Turn OFF 'Block untrusted touches' in phone Developer Options.\n" +
-                        "• Method 3 (Recommended): Pair a Bluetooth gamepad (Xbox, PlayStation, 8BitDo) or Bluetooth mouse to effortlessly navigate YouTube, emulators, and games while wearing the headset!"
+                title = "Gear VR Touchpad & Trusted Touch (Zero Dev Options)",
+                description = "Works on any unmodified school or teacher phone without touching Developer Options:\n\n" +
+                        "• Enable Trusted Touch: Tap 'Enable Trusted Touch & Gear VR Pad' on the Home screen and toggle ON 'VR Lens SBS Touch & Gear VR Touchpad' in Accessibility. This upgrades the overlay to a trusted OS layer (TYPE_ACCESSIBILITY_OVERLAY) so Android 12+ never blocks touches as 'untrusted'!\n" +
+                        "• Physical Gear VR Touchpad: When plugged into the Gear VR USB-C port, swipe on the headset's side touchpad to move the 3D Stereoscopic Cursor across both eyes, tap to click, and press the Gear VR Back button to go back.\n" +
+                        "• Right-Edge Thumb Trackpad: Even if the USB-C connector is flipped up or the phone has a case, use the floating 'GEAR PAD' on the right edge of the screen to move the 3D cursor, click, scroll, or navigate Back!"
             )
 
             GuideStepCard(
@@ -184,7 +184,18 @@ fun GearVrGuideScreen(
                 icon = Icons.Default.CheckCircle,
                 iconColor = VrCyanNeon,
                 title = "Floating Quick Seam Controller",
-                description = "A slim control pill sits along the center divider between the lenses. Tap it anytime to toggle between Touch Pass-Through (underlying app) and VR Adjust mode, or to stop VR."
+                description = "A slim control pill sits along the center divider between the lenses. Tap it anytime to toggle between Touch Pass-Through (underlying app), 🌐 AR Camera mode, 🖐️ Hand AI gestures, or to stop VR."
+            )
+
+            GuideStepCard(
+                stepNumber = "6",
+                icon = Icons.Default.Visibility,
+                iconColor = VrGreenNeon,
+                title = "Apple Vision Pro Hand AI & AR Mode (In-Dev)",
+                description = "Use your S23+ rear camera for spatial hand gestures & Mixed-Reality AR while running any app:\n" +
+                        "• Selectable In-Dev Feature: Tap 'USE VISION PRO HAND GESTURES (IN-DEV)' or 'ENABLE AUGMENTED REALITY (AR) + HAND CAM' on the Home screen (or tap 🌐 AR / 🖐️ HAND on the center VR seam HUD).\n" +
+                        "• Hand Gestures & Gemini AI Vision: Wave your hand Left in front of the camera to slide Left in the active app, wave Right to slide Right, wave Up/Down to scroll, or Pinch thumb + index finger to click at the 3D Cursor.\n" +
+                        "• Augmented Reality (AR) Passthrough: Projects the live outward camera into both VR lenses with any app floating as a translucent spatial window over your real room!"
             )
 
             Spacer(modifier = Modifier.height(24.dp))

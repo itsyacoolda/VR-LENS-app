@@ -40,4 +40,21 @@ class ExampleUnitTest {
     assertFalse("Should start unpaused", gearVr.isPaused)
     assertFalse("Should start with touch peek disabled", gearVr.isTouchPeekMode)
   }
+
+  @Test
+  fun testHeadTrackingDefaultsAndModes() {
+    val settings = com.example.model.VrSettings()
+    assertTrue("Head tracking should default to enabled", settings.headTrackingEnabled)
+    assertEquals(com.example.model.VrSettings.HEAD_TRACKING_WORLD_LOCKED, settings.headTrackingMode)
+    assertEquals(1.0f, settings.headTrackingSensitivity, 0.001f)
+    assertEquals(0.22f, settings.headTrackingSmoothing, 0.001f)
+    assertFalse(settings.headTrackingInvertPitch)
+    assertFalse(settings.headTrackingInvertYaw)
+
+    val gazeMode = settings.copy(headTrackingMode = com.example.model.VrSettings.HEAD_TRACKING_GAZE_AIM)
+    assertEquals(com.example.model.VrSettings.HEAD_TRACKING_GAZE_AIM, gazeMode.headTrackingMode)
+
+    val canvasMode = settings.copy(headTrackingMode = com.example.model.VrSettings.HEAD_TRACKING_CINEMA_CANVAS)
+    assertEquals(com.example.model.VrSettings.HEAD_TRACKING_CINEMA_CANVAS, canvasMode.headTrackingMode)
+  }
 }

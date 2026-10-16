@@ -1,5 +1,6 @@
 package com.example.service
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,7 +8,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import androidx.core.content.ContextCompat
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Point
@@ -16,6 +20,7 @@ import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.AudioManager
+import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.opengl.GLSurfaceView
@@ -26,8 +31,10 @@ import android.os.Looper
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
+import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -39,22 +46,27 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.data.VrPreferencesRepository
+import com.example.graphics.VrFrameHolder
 import com.example.graphics.VrSbsRenderer
 import com.example.model.VrSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.hypot
 
 class VrOverlayService : Service() {
 
@@ -62,7 +74,10 @@ class VrOverlayService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private lateinit var windowManager: WindowManager
+    private lateinit var defaultWindowManager: WindowManager
+    private var activeWindowManager: WindowManager? = null
+    private var isUsingTrustedAccessibilityOverlay = false
+
     private lateinit var mediaProjectionManager: MediaProjectionManager
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -70,16 +85,33 @@ class VrOverlayService : Service() {
     private var glSurfaceView: GLSurfaceView? = null
     private var sbsRenderer: VrSbsRenderer? = null
     private var surface: Surface? = null
+    private var projectionImageReader: ImageReader? = null
+    @Volatile
+    private var isShutterSamplingExternalApp = false
+    @Volatile
+    private var isReadyForCleanExternalCapture = false
 
-    // Floating Interactive Controls
+    // Floating Interactive Controls & Gear VR Touchpad UI
     private var floatingHudView: View? = null
+    private var sideTouchpadView: View? = null
     private var floatingOpticsModal: View? = null
     private var isHudMinimized = false
+    private var isSideTouchpadMinimized = false
 
     private lateinit var prefsRepo: VrPreferencesRepository
     private var currentSettings: VrSettings = VrSettings()
 
     private var vibrator: Vibrator? = null
+    private var touchpadDriver: GearVrTouchpadDriver? = null
+    private var cameraHandController: VrArCameraHandController? = null
+    private var voiceControlManager: VrVoiceControlManager? = null
+    private var headTracker: VrHeadTracker? = null
+
+    // 2-Second Center Dot Dwell-Click tracking in overlay service
+    private var dwellAnchorX = 0.5f
+    private var dwellAnchorY = 0.5f
+    private var dwellStartTime = 0L
+    private var hasDwellClickedSpot = true
 
     // Touch gesture detectors for when Pass-Through is OFF
     private var scaleDetector: ScaleGestureDetector? = null
@@ -89,21 +121,102 @@ class VrOverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        instance = this
+        defaultWindowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         prefsRepo = VrPreferencesRepository.getInstance(applicationContext)
         vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
 
         currentSettings = prefsRepo.getSettings()
 
+        touchpadDriver = GearVrTouchpadDriver(applicationContext) { durationMs ->
+            vibrateBriefly(durationMs)
+        }.also { it.start() }
+
+        headTracker = VrHeadTracker(applicationContext) { yaw, pitch, roll ->
+            sbsRenderer?.updateHeadPose(yaw, pitch, roll)
+            glSurfaceView?.requestRender()
+        }.also {
+            if (currentSettings.headTrackingEnabled) {
+                it.start()
+            }
+        }
+
+        cameraHandController = VrArCameraHandController(
+            context = applicationContext,
+            onHapticFeedback = { durationMs -> vibrateBriefly(durationMs) },
+            onPlayPauseToggle = { togglePlayPauseContent() }
+        )
+
+        voiceControlManager = VrVoiceControlManager(
+            context = applicationContext,
+            onHapticFeedback = { durationMs -> vibrateBriefly(durationMs) },
+            onClickCenterDot = { triggerTouchpadClickAtCursor() },
+            onPlayPauseToggle = { togglePlayPauseContent() }
+        )
+
+        VrFrameHolder.onFrameUpdated = {
+            glSurfaceView?.requestRender()
+        }
+
         scope.launch {
             prefsRepo.settingsFlow.collect { newSettings ->
+                val trackingChanged = newSettings.headTrackingEnabled != currentSettings.headTrackingEnabled
                 currentSettings = newSettings
                 sbsRenderer?.settings = newSettings
+                if (trackingChanged) {
+                    if (newSettings.headTrackingEnabled) {
+                        headTracker?.start()
+                    } else {
+                        headTracker?.stop()
+                        sbsRenderer?.updateHeadPose(0f, 0f, 0f)
+                    }
+                }
                 glSurfaceView?.requestRender()
+                cameraHandController?.updateStateFromSettings()
+                voiceControlManager?.updateFromSettings()
                 updateTouchPassThroughFlag()
                 updateHudViews()
+                updateSideTouchpadViews()
                 _liveSettings.value = newSettings
+            }
+        }
+
+        // Ensure dwell progress is always cleared so clicking is purely triggered by Trackpad tap
+        if (currentSettings.dwellProgress > 0f) {
+            prefsRepo.setDwellProgress(0f)
+        }
+
+        // Periodic clean snapshot refresh when viewing external apps (outside MainActivity)
+        scope.launch {
+            var wasMainActivityVisible = VrFrameHolder.isMainActivityVisible
+            var lastExternalRefreshTime = 0L
+            while (isActive) {
+                delay(200L)
+                val isMainVis = VrFrameHolder.isMainActivityVisible
+                if (_isOverlayRunning.value &&
+                    !isMainVis &&
+                    !currentSettings.isPaused &&
+                    !currentSettings.isTouchPeekMode
+                ) {
+                    val now = SystemClock.uptimeMillis()
+                    val justLeftMainActivity = wasMainActivityVisible && !isMainVis
+                    if (justLeftMainActivity || (now - lastExternalRefreshTime >= 1100L)) {
+                        lastExternalRefreshTime = now
+                        requestCleanExternalAppFrame()
+                    }
+                }
+                wasMainActivityVisible = isMainVis
+            }
+        }
+
+        // Automatically upgrade overlay window to TYPE_ACCESSIBILITY_OVERLAY if user enables Accessibility Service while running
+        scope.launch {
+            VrAccessibilityService.isConnected.collect { connected ->
+                if (_isOverlayRunning.value && connected && !isUsingTrustedAccessibilityOverlay) {
+                    Log.i(tag, "Upgrading VR Overlay to Trusted TYPE_ACCESSIBILITY_OVERLAY")
+                    reattachOverlayWindowsWithTrustedContext()
+                }
             }
         }
     }
@@ -160,19 +273,128 @@ class VrOverlayService : Service() {
                 prefsRepo.toggleTouchPeek()
                 vibrateBriefly(40)
             }
+            ACTION_CLICK_CURSOR -> {
+                triggerTouchpadClickAtCursor()
+            }
             ACTION_RECENTER -> {
-                prefsRepo.updateSettings(
-                    currentSettings.copy(
-                        ipdOffset = 0.02f,
-                        scale = 0.85f,
-                        yOffset = 0.0f
-                    )
-                )
-                vibrateBriefly(30)
+                recenterHeadPose()
             }
         }
 
         return START_NOT_STICKY
+    }
+
+    fun recenterHeadPose() {
+        headTracker?.recenter()
+        prefsRepo.recenterCursor()
+        vibrateBriefly(30)
+    }
+
+    private fun resolveOverlayWindowManagerAndType(): Pair<WindowManager, Int> {
+        val a11yService = VrAccessibilityService.instance
+        return if (a11yService != null) {
+            isUsingTrustedAccessibilityOverlay = true
+            Pair(
+                a11yService.getTrustedWindowManager(),
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            )
+        } else {
+            isUsingTrustedAccessibilityOverlay = false
+            Pair(
+                defaultWindowManager,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            )
+        }
+    }
+
+    private fun reattachOverlayWindowsWithTrustedContext() {
+        val wm = activeWindowManager ?: defaultWindowManager
+        try {
+            floatingOpticsModal?.let { wm.removeView(it) }
+            floatingOpticsModal = null
+        } catch (_: Exception) {}
+        try {
+            sideTouchpadView?.let { wm.removeView(it) }
+            sideTouchpadView = null
+        } catch (_: Exception) {}
+        try {
+            floatingHudView?.let { wm.removeView(it) }
+            floatingHudView = null
+        } catch (_: Exception) {}
+
+        val (newWm, newType) = resolveOverlayWindowManagerAndType()
+        activeWindowManager = newWm
+
+        glSurfaceView?.let { glView ->
+            try {
+                wm.removeView(glView)
+            } catch (_: Exception) {}
+            val surfaceParams = createGlSurfaceLayoutParams(newType)
+            try {
+                newWm.addView(glView, surfaceParams)
+            } catch (e: Exception) {
+                Log.e(tag, "Error re-adding GLSurfaceView with trusted type: ${e.message}")
+            }
+        }
+
+        setupInteractiveControlsHud(newWm, newType)
+        setupSideGearVrTouchpad(newWm, newType)
+    }
+
+    fun triggerTouchpadClickAtCursor() {
+        vibrateBriefly(30)
+        val s = prefsRepo.getSettings()
+        prefsRepo.setCursorClicking(true)
+        prefsRepo.setLastDetectedGesture(
+            "🎯 Trackpad Clicked at (${(s.cursorX * 100).toInt()}%, ${(s.cursorY * 100).toInt()}%)"
+        )
+        mainHandler.postDelayed({
+            prefsRepo.setCursorClicking(false)
+        }, 220L)
+
+        val a11y = VrAccessibilityService.instance
+        if (a11y != null) {
+            // Ensure glSurfaceView has FLAG_NOT_TOUCHABLE during gesture injection
+            temporarilyEnsurePassThroughForGesture()
+            a11y.dispatchTapAtCursor()
+            if (!VrFrameHolder.isMainActivityVisible) {
+                mainHandler.postDelayed({
+                    requestCleanExternalAppFrame()
+                }, 320L)
+            }
+        } else {
+            MainActivity.dispatchInAppTouchAtNormalized(s.cursorX, s.cursorY)
+        }
+    }
+
+    fun temporarilyEnsurePassThroughForGesture() {
+        val view = glSurfaceView ?: return
+        val wm = activeWindowManager ?: defaultWindowManager
+        val params = view.layoutParams as? WindowManager.LayoutParams ?: return
+        val hasNotTouchable = (params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) != 0
+        if (!hasNotTouchable) {
+            params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            try {
+                wm.updateViewLayout(view, params)
+            } catch (_: Exception) {}
+            mainHandler.postDelayed({
+                updateTouchPassThroughFlag()
+            }, 150L)
+        }
+    }
+
+    private fun promptEnableTrustedTouchAccessibility() {
+        Toast.makeText(
+            this,
+            "Turn ON 'VR Lens SBS Touch & Gear VR Touchpad' in Accessibility to enable Trusted Touch without Developer Options!",
+            Toast.LENGTH_LONG
+        ).show()
+        try {
+            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            startActivity(intent)
+        } catch (_: Exception) {}
     }
 
     fun togglePlayPauseContent() {
@@ -205,9 +427,9 @@ class VrOverlayService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val toggleTouchIntent = PendingIntent.getService(
+        val clickCursorIntent = PendingIntent.getService(
             this, 2,
-            Intent(this, VrOverlayService::class.java).apply { action = ACTION_TOGGLE_TOUCH },
+            Intent(this, VrOverlayService::class.java).apply { action = ACTION_CLICK_CURSOR },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -220,23 +442,32 @@ class VrOverlayService : Service() {
         val pauseLabel = if (currentSettings.isPaused) "Play" else "Pause"
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("VR SBS Overlay Active")
-            .setContentText("Controls: Play/Pause, Resize, Split available on headset seam")
+            .setContentTitle("VR SBS & Gear VR Touchpad Active")
+            .setContentText("Trusted Touch & 3D Stereoscopic VR Cursor Ready")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(openAppIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .addAction(android.R.drawable.ic_media_play, pauseLabel, playPauseIntent)
-            .addAction(android.R.drawable.ic_menu_rotate, "Touch Mode", toggleTouchIntent)
+            .addAction(android.R.drawable.ic_menu_mylocation, "VR Click", clickCursorIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop VR", exitIntent)
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val hasCameraPerm = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+            val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && hasCameraPerm) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            }
             ServiceCompat.startForeground(
                 this,
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                fgType
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
@@ -277,27 +508,70 @@ class VrOverlayService : Service() {
         }
     }
 
+    private fun createGlSurfaceLayoutParams(windowType: Int): WindowManager.LayoutParams {
+        val overlayFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+
+        val initialFlags = if (currentSettings.touchPassThrough) {
+            overlayFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        } else {
+            overlayFlags
+        }
+
+        return WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            windowType,
+            initialFlags,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.FILL
+        }
+    }
+
     private fun setupOverlayViews() {
+        val (wm, windowType) = resolveOverlayWindowManagerAndType()
+        activeWindowManager = wm
+
         // 1. Fullscreen GLSurfaceView for SBS rendering
         glSurfaceView = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
             setZOrderOnTop(false)
         }
 
-        sbsRenderer = VrSbsRenderer(glSurfaceView!!) { surfaceTexture ->
-            mainHandler.post {
-                setupVirtualDisplay(surfaceTexture)
+        sbsRenderer = VrSbsRenderer(
+            glSurfaceView = glSurfaceView!!,
+            onCameraSurfaceTextureReady = { camSurfaceTexture ->
+                mainHandler.post {
+                    cameraHandController?.setGlCameraSurfaceTexture(camSurfaceTexture)
+                    cameraHandController?.updateStateFromSettings()
+                }
+            },
+            onSurfaceTextureReady = { surfaceTexture ->
+                mainHandler.post {
+                    setupVirtualDisplay(surfaceTexture)
+                }
             }
-        }.apply {
+        ).apply {
             settings = currentSettings
         }
 
         glSurfaceView?.setRenderer(sbsRenderer)
-        glSurfaceView?.renderMode = GLSurfaceView.RENDERMODE_WHEN_DIRTY
+        glSurfaceView?.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
         setupGestureDetectors()
-        glSurfaceView?.setOnTouchListener { _, event ->
-            if (!currentSettings.touchPassThrough) {
+        glSurfaceView?.setOnGenericMotionListener { v, event ->
+            touchpadDriver?.handleTouchpadMotionEvent(event, v.width, v.height) ?: false
+        }
+        glSurfaceView?.setOnTouchListener { v, event ->
+            val isFromExternalTouchpad =
+                (event.source and InputDevice.SOURCE_TOUCHPAD) == InputDevice.SOURCE_TOUCHPAD ||
+                        (event.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+            if (isFromExternalTouchpad && currentSettings.gearVrTouchpadEnabled) {
+                touchpadDriver?.handleTouchpadMotionEvent(event, v.width, v.height) ?: true
+            } else if (!currentSettings.touchPassThrough) {
                 scaleDetector?.onTouchEvent(event)
                 handleManualTouchAdjustment(event)
                 true
@@ -306,30 +580,10 @@ class VrOverlayService : Service() {
             }
         }
 
-        val overlayFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
-                WindowManager.LayoutParams.FLAG_SECURE // Prevents feedback mirror loop in screen capture!
-
-        val initialFlags = if (currentSettings.touchPassThrough) {
-            overlayFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        } else {
-            overlayFlags
-        }
-
-        val surfaceParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            initialFlags,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.FILL
-        }
+        val surfaceParams = createGlSurfaceLayoutParams(windowType)
 
         try {
-            windowManager.addView(glSurfaceView, surfaceParams)
+            wm.addView(glSurfaceView, surfaceParams)
         } catch (e: Exception) {
             Log.e(tag, "Failed to add GLSurfaceView to WindowManager", e)
             stopSelf()
@@ -337,17 +591,20 @@ class VrOverlayService : Service() {
         }
 
         // 2. Setup Unobtrusive Floating VR Seam Controller (along nose bridge)
-        setupInteractiveControlsHud()
+        setupInteractiveControlsHud(wm, windowType)
+
+        // 3. Setup Right-Edge Gear VR Touchpad & 3D Cursor Controller
+        setupSideGearVrTouchpad(wm, windowType)
     }
 
     private fun updateTouchPassThroughFlag() {
+        val wm = activeWindowManager ?: defaultWindowManager
         glSurfaceView?.let { view ->
             val params = view.layoutParams as? WindowManager.LayoutParams ?: return
             val overlayFlags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
-                    WindowManager.LayoutParams.FLAG_SECURE
+                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
 
             params.flags = if (currentSettings.touchPassThrough) {
                 overlayFlags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
@@ -356,7 +613,7 @@ class VrOverlayService : Service() {
             }
 
             try {
-                windowManager.updateViewLayout(view, params)
+                wm.updateViewLayout(view, params)
             } catch (e: Exception) {
                 Log.e(tag, "Error updating overlay touch flags: ${e.message}")
             }
@@ -404,37 +661,143 @@ class VrOverlayService : Service() {
     }
 
     private fun setupVirtualDisplay(surfaceTexture: SurfaceTexture) {
-        val windowMetrics = windowManager.defaultDisplay
+        val windowMetrics = defaultWindowManager.defaultDisplay
         val size = Point()
+        @Suppress("DEPRECATION")
         windowMetrics.getRealSize(size)
-        val screenWidth = size.x
-        val screenHeight = size.y
+        val captureW = (size.x / 2).coerceIn(320, 720)
+        val captureH = (size.y / 2).coerceIn(480, 1440)
         val densityDpi = resources.displayMetrics.densityDpi
 
-        surfaceTexture.setDefaultBufferSize(screenWidth, screenHeight)
-        surface = Surface(surfaceTexture)
+        surfaceTexture.setDefaultBufferSize(captureW, captureH)
 
         try {
+            projectionImageReader?.close()
+            projectionImageReader = ImageReader.newInstance(
+                captureW,
+                captureH,
+                PixelFormat.RGBA_8888,
+                2
+            ).apply {
+                setOnImageAvailableListener({ reader ->
+                    val image = try {
+                        reader.acquireLatestImage()
+                    } catch (_: Exception) {
+                        null
+                    } ?: return@setOnImageAvailableListener
+
+                    try {
+                        // When MainActivity is visible, MainActivity feeds its own Window directly
+                        // into VrFrameHolder via PixelCopy/Canvas with zero overlay interference.
+                        // When viewing external apps, only accept frames when the overlay is hidden
+                        // (either Touch Peek mode or during the verified clean shutter window).
+                        val canAcceptExternalFrame = !VrFrameHolder.isMainActivityVisible &&
+                                (currentSettings.isTouchPeekMode || isReadyForCleanExternalCapture)
+
+                        if (canAcceptExternalFrame) {
+                            val plane = image.planes[0]
+                            val buffer = plane.buffer
+                            val pixelStride = plane.pixelStride
+                            val rowStride = plane.rowStride
+                            val rowPadding = rowStride - pixelStride * captureW
+                            val bmpWidth = captureW + rowPadding / pixelStride
+
+                            // Verify left-edge vertical center marker (x = 2, y = captureH / 2) is NOT present
+                            val markerY = captureH / 2
+                            val markerOffset = (markerY * rowStride) + (2 * pixelStride)
+                            var isFeedbackFrame = false
+                            if (markerOffset >= 0 && markerOffset + 3 < buffer.limit()) {
+                                val r = buffer.get(markerOffset).toInt() and 0xFF
+                                val g = buffer.get(markerOffset + 1).toInt() and 0xFF
+                                val b = buffer.get(markerOffset + 2).toInt() and 0xFF
+                                // Matches vec4(0.051, 0.949, 0.741, 1.0) -> rgb(13, 242, 189)
+                                if (r in 0..45 && g in 200..255 && b in 145..225) {
+                                    isFeedbackFrame = true
+                                }
+                            }
+
+                            if (!isFeedbackFrame || currentSettings.isTouchPeekMode) {
+                                buffer.position(0)
+                                val rawBmp = Bitmap.createBitmap(bmpWidth, captureH, Bitmap.Config.ARGB_8888)
+                                rawBmp.copyPixelsFromBuffer(buffer)
+                                val cropped = if (bmpWidth != captureW) {
+                                    Bitmap.createBitmap(rawBmp, 0, 0, captureW, captureH).also {
+                                        rawBmp.recycle()
+                                    }
+                                } else {
+                                    rawBmp
+                                }
+
+                                isReadyForCleanExternalCapture = false
+                                VrFrameHolder.updateFromCleanProjection(cropped)
+                                glSurfaceView?.requestRender()
+
+                                if (isShutterSamplingExternalApp) {
+                                    mainHandler.post {
+                                        restoreOverlayAlphaAfterShutter()
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        image.close()
+                    }
+                }, mainHandler)
+            }
+
+            surface = projectionImageReader?.surface
+
             virtualDisplay = mediaProjection?.createVirtualDisplay(
                 "VrSbsVirtualDisplay",
-                screenWidth,
-                screenHeight,
+                captureW,
+                captureH,
                 densityDpi,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 surface,
                 null,
                 null
             )
-            Log.i(tag, "VirtualDisplay created: ${screenWidth}x${screenHeight} at ${densityDpi}dpi")
+            Log.i(tag, "VirtualDisplay created: ${captureW}x${captureH} at ${densityDpi}dpi")
         } catch (e: Exception) {
             Log.e(tag, "Error creating VirtualDisplay", e)
+        }
+    }
+
+    private fun restoreOverlayAlphaAfterShutter() {
+        val targetAlpha = if (currentSettings.isTouchPeekMode) 0.0f else 1.0f
+        glSurfaceView?.alpha = targetAlpha
+        floatingHudView?.alpha = 1.0f
+        sideTouchpadView?.alpha = 1.0f
+        isReadyForCleanExternalCapture = false
+        isShutterSamplingExternalApp = false
+    }
+
+    fun requestCleanExternalAppFrame() {
+        val view = glSurfaceView ?: return
+        if (isShutterSamplingExternalApp || VrFrameHolder.isMainActivityVisible) return
+        isShutterSamplingExternalApp = true
+        mainHandler.post {
+            try {
+                projectionImageReader?.acquireLatestImage()?.close()
+            } catch (_: Exception) {}
+            isReadyForCleanExternalCapture = true
+            view.alpha = 0.0f
+            floatingHudView?.alpha = 0.0f
+            sideTouchpadView?.alpha = 0.0f
+            // Safety timeout to restore overlay alpha even if external screen is static
+            mainHandler.postDelayed({
+                if (isShutterSamplingExternalApp) {
+                    restoreOverlayAlphaAfterShutter()
+                }
+            }, 95L)
         }
     }
 
     /**
      * Creates the sleek, non-obstructing interactive control HUD aligned with the headset seam.
      */
-    private fun setupInteractiveControlsHud() {
+    private fun setupInteractiveControlsHud(wm: WindowManager, windowType: Int) {
         val root = FrameLayout(this)
 
         val pillBackground = GradientDrawable().apply {
@@ -449,7 +812,7 @@ class VrOverlayService : Service() {
             id = View.generateViewId()
             orientation = LinearLayout.HORIZONTAL
             background = pillBackground
-            setPadding(18, 10, 18, 10)
+            setPadding(16, 8, 16, 8)
             gravity = Gravity.CENTER_VERTICAL
         }
 
@@ -460,7 +823,7 @@ class VrOverlayService : Service() {
                 if (currentSettings.isPaused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
             )
             setColorFilter(Color.parseColor("#00E5FF"))
-            setPadding(12, 8, 12, 8)
+            setPadding(10, 8, 10, 8)
             setOnClickListener {
                 togglePlayPauseContent()
                 setImageResource(
@@ -472,9 +835,9 @@ class VrOverlayService : Service() {
         // 2. Resize Overlay Window Section: [-] Size% [+]
         val resizeDownBtn = TextView(this).apply {
             text = "－"
-            textSize = 18f
+            textSize = 16f
             setTextColor(Color.WHITE)
-            setPadding(14, 6, 10, 6)
+            setPadding(12, 6, 8, 6)
             setOnClickListener {
                 prefsRepo.adjustScale(-0.05f)
                 vibrateBriefly(20)
@@ -484,7 +847,7 @@ class VrOverlayService : Service() {
         val sizeIndicator = TextView(this).apply {
             id = View.generateViewId()
             text = "${(currentSettings.scale * 100).toInt()}%"
-            textSize = 11f
+            textSize = 10.5f
             setTextColor(Color.parseColor("#80F2FF"))
             paint.isFakeBoldText = true
             setPadding(4, 0, 4, 0)
@@ -492,19 +855,18 @@ class VrOverlayService : Service() {
 
         val resizeUpBtn = TextView(this).apply {
             text = "＋"
-            textSize = 18f
+            textSize = 16f
             setTextColor(Color.WHITE)
-            setPadding(10, 6, 14, 6)
+            setPadding(8, 6, 12, 6)
             setOnClickListener {
                 prefsRepo.adjustScale(+0.05f)
                 vibrateBriefly(20)
             }
         }
 
-        // Vertical divider line
         val divider1 = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(2, 36).apply {
-                setMargins(6, 0, 6, 0)
+            layoutParams = LinearLayout.LayoutParams(2, 34).apply {
+                setMargins(4, 0, 4, 0)
             }
             setBackgroundColor(Color.parseColor("#26334D"))
         }
@@ -512,9 +874,9 @@ class VrOverlayService : Service() {
         // 3. Adjust SBS Split Section: [◀] Split [▶]
         val splitInBtn = TextView(this).apply {
             text = "◀"
-            textSize = 12f
+            textSize = 11f
             setTextColor(Color.WHITE)
-            setPadding(12, 8, 6, 8)
+            setPadding(10, 8, 6, 8)
             setOnClickListener {
                 prefsRepo.adjustIpd(-0.01f)
                 vibrateBriefly(20)
@@ -524,7 +886,7 @@ class VrOverlayService : Service() {
         val splitIndicator = TextView(this).apply {
             id = View.generateViewId()
             text = "IPD ${(currentSettings.ipdOffset * 100).toInt()}"
-            textSize = 11f
+            textSize = 10.5f
             setTextColor(Color.parseColor("#B388FF"))
             paint.isFakeBoldText = true
             setPadding(4, 0, 4, 0)
@@ -532,81 +894,26 @@ class VrOverlayService : Service() {
 
         val splitOutBtn = TextView(this).apply {
             text = "▶"
-            textSize = 12f
+            textSize = 11f
             setTextColor(Color.WHITE)
-            setPadding(6, 8, 12, 8)
+            setPadding(6, 8, 10, 8)
             setOnClickListener {
                 prefsRepo.adjustIpd(+0.01f)
                 vibrateBriefly(20)
             }
         }
 
-        // Vertical divider line
         val divider2 = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(2, 36).apply {
-                setMargins(6, 0, 6, 0)
+            layoutParams = LinearLayout.LayoutParams(2, 34).apply {
+                setMargins(4, 0, 4, 0)
             }
             setBackgroundColor(Color.parseColor("#26334D"))
         }
 
-        // 4. Touch Pass-Through Mode toggle
-        val touchModeBtn = TextView(this).apply {
+        // 4. Touchpad Cursor Click Button
+        val cursorClickBtn = TextView(this).apply {
             id = View.generateViewId()
-            text = if (currentSettings.touchPassThrough) "TOUCH PASS" else "VR CONTROLS"
-            textSize = 10f
-            paint.isFakeBoldText = true
-            setTextColor(if (currentSettings.touchPassThrough) Color.parseColor("#00E676") else Color.parseColor("#FF9100"))
-            setPadding(12, 6, 12, 6)
-            setOnClickListener {
-                val newMode = !currentSettings.touchPassThrough
-                prefsRepo.setTouchPassThrough(newMode)
-                vibrateBriefly(40)
-            }
-        }
-
-        // 5. Lens Distortion & Optics Quick Modal Button
-        val lensOpticsBtn = ImageView(this).apply {
-            setImageResource(android.R.drawable.ic_menu_preferences)
-            setColorFilter(Color.parseColor("#00E5FF"))
-            setPadding(10, 8, 10, 8)
-            setOnClickListener {
-                toggleInVrOpticsModal()
-            }
-        }
-
-        // 6. Minimize to tiny dot button (so user has zero obstruction)
-        val minimizeBtn = TextView(this).apply {
-            text = "▲"
-            textSize = 12f
-            setTextColor(Color.parseColor("#94A3B8"))
-            setPadding(10, 8, 10, 8)
-            setOnClickListener {
-                collapseHud()
-            }
-        }
-
-        // 7. Stop VR
-        val stopVrBtn = ImageView(this).apply {
-            setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
-            setColorFilter(Color.parseColor("#FF5252"))
-            setPadding(10, 8, 6, 8)
-            setOnClickListener {
-                vibrateBriefly(50)
-                stopSelf()
-            }
-        }
-
-        // Vertical divider line
-        val divider3 = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(2, 36).apply {
-                setMargins(6, 0, 6, 0)
-            }
-            setBackgroundColor(Color.parseColor("#26334D"))
-        }
-
-        // Direct Touch Peek Button: instantly suspends overlay so touches work on underlying app
-        val touchPeekBtn = TextView(this).apply {
-            text = "👆 TOUCH APP"
+            text = "🎯 CLICK"
             textSize = 10f
             paint.isFakeBoldText = true
             setTextColor(Color.parseColor("#00E676"))
@@ -619,8 +926,98 @@ class VrOverlayService : Service() {
             background = btnBg
             setPadding(10, 6, 10, 6)
             setOnClickListener {
+                triggerTouchpadClickAtCursor()
+            }
+        }
+
+        val divider3 = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(2, 34).apply {
+                setMargins(4, 0, 4, 0)
+            }
+            setBackgroundColor(Color.parseColor("#26334D"))
+        }
+
+        // 5. Direct Touch Peek Button
+        val touchPeekBtn = TextView(this).apply {
+            text = "👆 PEEK"
+            textSize = 10f
+            paint.isFakeBoldText = true
+            setTextColor(Color.parseColor("#00E5FF"))
+            setPadding(8, 6, 8, 6)
+            setOnClickListener {
                 prefsRepo.setTouchPeek(true)
                 vibrateBriefly(40)
+            }
+        }
+
+        // 5b. Augmented Reality (AR) Camera Passthrough Toggle Button
+        val arToggleBtn = TextView(this).apply {
+            text = if (currentSettings.arPassthroughEnabled) "🌐 AR ON" else "🌐 AR"
+            textSize = 10f
+            paint.isFakeBoldText = true
+            setTextColor(if (currentSettings.arPassthroughEnabled) Color.parseColor("#00E676") else Color.parseColor("#B388FF"))
+            setPadding(8, 6, 8, 6)
+            setOnClickListener {
+                prefsRepo.setArPassthroughEnabled(!currentSettings.arPassthroughEnabled)
+                vibrateBriefly(35)
+            }
+        }
+
+        // 5c. Apple Vision Pro Hand Gesture Tracking (In-Dev) Toggle Button
+        val handAiBtn = TextView(this).apply {
+            text = if (currentSettings.handTrackingEnabled) "🖐️ HAND ON" else "🖐️ HAND"
+            textSize = 10f
+            paint.isFakeBoldText = true
+            setTextColor(if (currentSettings.handTrackingEnabled) Color.parseColor("#00E676") else Color.parseColor("#80F2FF"))
+            setPadding(8, 6, 8, 6)
+            setOnClickListener {
+                prefsRepo.setHandTrackingEnabled(!currentSettings.handTrackingEnabled)
+                vibrateBriefly(35)
+            }
+        }
+
+        // 5d. Curved Cinema Screen Display Mode Toggle Button
+        val cinemaBtn = TextView(this).apply {
+            text = if (currentSettings.cinemaScreenEnabled) "🎬 CURVED" else "🎬 FLAT"
+            textSize = 10f
+            paint.isFakeBoldText = true
+            setTextColor(if (currentSettings.cinemaScreenEnabled) Color.parseColor("#00E5FF") else Color.parseColor("#94A3B8"))
+            setPadding(8, 6, 8, 6)
+            setOnClickListener {
+                prefsRepo.setCinemaScreenEnabled(!currentSettings.cinemaScreenEnabled)
+                vibrateBriefly(35)
+            }
+        }
+
+        // 6. Lens Distortion & Optics Quick Modal Button
+        val lensOpticsBtn = ImageView(this).apply {
+            setImageResource(android.R.drawable.ic_menu_preferences)
+            setColorFilter(Color.parseColor("#00E5FF"))
+            setPadding(8, 8, 8, 8)
+            setOnClickListener {
+                toggleInVrOpticsModal()
+            }
+        }
+
+        // 7. Minimize to tiny dot button
+        val minimizeBtn = TextView(this).apply {
+            text = "▲"
+            textSize = 11f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(8, 8, 8, 8)
+            setOnClickListener {
+                collapseHud()
+            }
+        }
+
+        // 8. Stop VR
+        val stopVrBtn = ImageView(this).apply {
+            setImageResource(android.R.drawable.ic_menu_close_clear_cancel)
+            setColorFilter(Color.parseColor("#FF5252"))
+            setPadding(8, 8, 6, 8)
+            setOnClickListener {
+                vibrateBriefly(50)
+                stopSelf()
             }
         }
 
@@ -633,9 +1030,12 @@ class VrOverlayService : Service() {
         expandedLayout.addView(splitIndicator)
         expandedLayout.addView(splitOutBtn)
         expandedLayout.addView(divider2)
-        expandedLayout.addView(touchModeBtn)
+        expandedLayout.addView(cursorClickBtn)
         expandedLayout.addView(divider3)
         expandedLayout.addView(touchPeekBtn)
+        expandedLayout.addView(arToggleBtn)
+        expandedLayout.addView(handAiBtn)
+        expandedLayout.addView(cinemaBtn)
         expandedLayout.addView(lensOpticsBtn)
         expandedLayout.addView(minimizeBtn)
         expandedLayout.addView(stopVrBtn)
@@ -685,7 +1085,7 @@ class VrOverlayService : Service() {
         }
 
         val peekTitle = TextView(this).apply {
-            text = "👆 SCREEN TOUCH ACTIVE"
+            text = "👆 DIRECT SCREEN TOUCH"
             textSize = 11f
             paint.isFakeBoldText = true
             setTextColor(Color.parseColor("#00E676"))
@@ -710,40 +1110,21 @@ class VrOverlayService : Service() {
             }
         }
 
-        val devSettingsBtn = TextView(this).apply {
-            text = "⚙️ Dev Fix"
-            textSize = 10f
-            setTextColor(Color.parseColor("#94A3B8"))
-            setPadding(12, 6, 6, 6)
-            setOnClickListener {
-                try {
-                    val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                    }
-                    startActivity(intent)
-                } catch (_: Exception) {
-                    try {
-                        val generalIntent = Intent(android.provider.Settings.ACTION_SETTINGS).apply {
-                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                        }
-                        startActivity(generalIntent)
-                    } catch (_: Exception) {}
-                }
-            }
-        }
-
         touchPeekBar.addView(peekTitle)
         touchPeekBar.addView(returnToVrBtn)
-        touchPeekBar.addView(devSettingsBtn)
 
         root.addView(expandedLayout)
         root.addView(collapsedDot)
         root.addView(touchPeekBar)
 
+        root.setOnGenericMotionListener { v, event ->
+            touchpadDriver?.handleTouchpadMotionEvent(event, v.width, v.height) ?: false
+        }
+
         val hudParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            windowType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -753,12 +1134,381 @@ class VrOverlayService : Service() {
 
         floatingHudView = root
         try {
-            windowManager.addView(root, hudParams)
+            wm.addView(root, hudParams)
         } catch (e: Exception) {
             Log.e(tag, "Failed to add floating controls HUD", e)
         }
 
         updateHudViews()
+    }
+
+    /**
+     * Creates a sleek, right-edge Gear VR Touchpad & 3D Stereoscopic Cursor controller.
+     * Works with both the physical Gear VR touchpad (USB-C / HID) AND right-thumb swipe/tap gestures
+     * so the student and teacher can effortlessly point, click, scroll, and go Back in VR!
+     */
+    private fun setupSideGearVrTouchpad(wm: WindowManager, windowType: Int) {
+        val root = FrameLayout(this)
+
+        val padBg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = 28f
+            setColor(Color.parseColor("#D90B0F17"))
+            setStroke(2, Color.parseColor("#4D00E5FF"))
+        }
+
+        val expandedPad = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = padBg
+            setPadding(12, 12, 12, 12)
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+
+        val padTitle = TextView(this).apply {
+            text = "GEAR PAD"
+            textSize = 9f
+            setTextColor(Color.parseColor("#00E5FF"))
+            paint.isFakeBoldText = true
+            setPadding(4, 0, 8, 0)
+        }
+
+        val minPadBtn = TextView(this).apply {
+            text = "▶"
+            textSize = 10f
+            setTextColor(Color.parseColor("#94A3B8"))
+            setPadding(6, 2, 4, 2)
+            setOnClickListener {
+                isSideTouchpadMinimized = true
+                updateSideTouchpadViews()
+                vibrateBriefly(20)
+            }
+        }
+
+        headerRow.addView(padTitle)
+        headerRow.addView(minPadBtn)
+        expandedPad.addView(headerRow)
+
+        // Interactive Trackpad Surface for moving the 3D Stereoscopic VR Cursor & Tapping
+        val trackpadSurface = FrameLayout(this).apply {
+            val surfaceBg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 20f
+                setColor(Color.parseColor("#1A00E5FF"))
+                setStroke(2, Color.parseColor("#6600E676"))
+            }
+            background = surfaceBg
+            layoutParams = LinearLayout.LayoutParams(180, 135).apply {
+                setMargins(0, 6, 0, 6)
+            }
+
+            val hintLabel = TextView(context).apply {
+                text = "SWIPE CURSOR\nTAP TO CLICK"
+                textSize = 8.5f
+                gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#CCFFFFFF"))
+                paint.isFakeBoldText = true
+                layoutParams = FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER
+                )
+            }
+            addView(hintLabel)
+
+            setOnGenericMotionListener { v, event ->
+                touchpadDriver?.handleTouchpadMotionEvent(event, v.width, v.height) ?: false
+            }
+
+            setOnTouchListener { v, event ->
+                TemporarilyEnsureGestureReady()
+                touchpadDriver?.handleTouchpadMotionEvent(event, v.width, v.height) ?: true
+            }
+        }
+        expandedPad.addView(trackpadSurface)
+
+        // Mode Toggle: Pointer (Aim) vs Scroll vs Zoom/IPD Mode
+        val modeToggleBtn = TextView(this).apply {
+            id = View.generateViewId()
+            val mode = currentSettings.touchpadMode
+            text = when (mode) {
+                VrSettings.TOUCHPAD_MODE_POINTER -> "🎯 AIM & TAP"
+                VrSettings.TOUCHPAD_MODE_SCROLL -> "📜 SCROLL"
+                VrSettings.TOUCHPAD_MODE_ZOOM_IPD -> "🔍 ZOOM/IPD"
+                else -> "🎯 AIM"
+            }
+            textSize = 9f
+            paint.isFakeBoldText = true
+            gravity = Gravity.CENTER
+            setTextColor(Color.BLACK)
+            val modeBg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 14f
+                setColor(
+                    when (mode) {
+                        VrSettings.TOUCHPAD_MODE_POINTER -> Color.parseColor("#00E5FF")
+                        VrSettings.TOUCHPAD_MODE_SCROLL -> Color.parseColor("#B388FF")
+                        VrSettings.TOUCHPAD_MODE_ZOOM_IPD -> Color.parseColor("#00E676")
+                        else -> Color.parseColor("#00E5FF")
+                    }
+                )
+            }
+            background = modeBg
+            setPadding(8, 7, 8, 7)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(0, 2, 0, 5)
+            }
+            setOnClickListener {
+                prefsRepo.cycleTouchpadMode()
+                vibrateBriefly(30)
+            }
+        }
+        expandedPad.addView(modeToggleBtn)
+
+        // Gear VR Side Buttons Row 1: HOME + BACK
+        val navRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(0, 0, 0, 4)
+            }
+        }
+
+        val homeBtn = TextView(this).apply {
+            text = "🏠 HOME"
+            textSize = 8.5f
+            paint.isFakeBoldText = true
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 12f
+                setColor(Color.parseColor("#2A1B4E"))
+            }
+            setPadding(8, 8, 8, 8)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, 0, 3, 0)
+            }
+            setOnClickListener {
+                val a11y = VrAccessibilityService.instance
+                if (a11y != null) {
+                    vibrateBriefly(30)
+                    a11y.triggerHomeButton()
+                } else {
+                    promptEnableTrustedTouchAccessibility()
+                }
+            }
+        }
+
+        val backBtn = TextView(this).apply {
+            text = "🔙 BACK"
+            textSize = 8.5f
+            paint.isFakeBoldText = true
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 12f
+                setColor(Color.parseColor("#26334D"))
+            }
+            setPadding(8, 8, 8, 8)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(3, 0, 0, 0)
+            }
+            setOnClickListener {
+                val a11y = VrAccessibilityService.instance
+                if (a11y != null) {
+                    vibrateBriefly(30)
+                    a11y.triggerBackButton()
+                } else {
+                    promptEnableTrustedTouchAccessibility()
+                }
+            }
+        }
+        navRow.addView(homeBtn)
+        navRow.addView(backBtn)
+        expandedPad.addView(navRow)
+
+        // Gear VR Side Buttons Row 2: VOL+ & VOL-
+        val volRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val volUpBtn = TextView(this).apply {
+            text = "🔊 VOL+"
+            textSize = 8.5f
+            paint.isFakeBoldText = true
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#00E676"))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 12f
+                setColor(Color.parseColor("#142834"))
+            }
+            setPadding(8, 7, 8, 7)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(0, 0, 3, 0)
+            }
+            setOnClickListener {
+                vibrateBriefly(25)
+                val a11y = VrAccessibilityService.instance
+                if (a11y != null) {
+                    a11y.handleVolumeUpButton()
+                } else {
+                    prefsRepo.adjustScale(+0.04f)
+                }
+            }
+        }
+
+        val volDownBtn = TextView(this).apply {
+            text = "🔉 VOL-"
+            textSize = 8.5f
+            paint.isFakeBoldText = true
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#00E5FF"))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 12f
+                setColor(Color.parseColor("#142834"))
+            }
+            setPadding(8, 7, 8, 7)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(3, 0, 0, 0)
+            }
+            setOnClickListener {
+                vibrateBriefly(25)
+                val a11y = VrAccessibilityService.instance
+                if (a11y != null) {
+                    a11y.handleVolumeDownButton()
+                } else {
+                    prefsRepo.adjustScale(-0.04f)
+                }
+            }
+        }
+        volRow.addView(volUpBtn)
+        volRow.addView(volDownBtn)
+        expandedPad.addView(volRow)
+
+        val recenterPadBtn = TextView(this).apply {
+            text = "🎯 RECENTER VIEW"
+            textSize = 8.5f
+            paint.isFakeBoldText = true
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#00E5FF"))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 12f
+                setColor(Color.parseColor("#102236"))
+                setStroke(1, Color.parseColor("#3300E5FF"))
+            }
+            setPadding(8, 7, 8, 7)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                setMargins(0, 6, 0, 0)
+            }
+            setOnClickListener {
+                recenterHeadPose()
+            }
+        }
+        expandedPad.addView(recenterPadBtn)
+
+        // Collapsed Right-Edge Pill Tab
+        val collapsedTab = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            val tabBg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 24f
+                setColor(Color.parseColor("#CC0D1117"))
+                setStroke(2, Color.parseColor("#00E676"))
+            }
+            background = tabBg
+            setPadding(12, 18, 12, 18)
+            gravity = Gravity.CENTER
+
+            val tabText = TextView(context).apply {
+                text = "◀\nP\nA\nD"
+                textSize = 9f
+                gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#00E676"))
+                paint.isFakeBoldText = true
+            }
+            addView(tabText)
+            setOnClickListener {
+                isSideTouchpadMinimized = false
+                updateSideTouchpadViews()
+                vibrateBriefly(25)
+            }
+        }
+
+        root.addView(expandedPad)
+        root.addView(collapsedTab)
+
+        val sideParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            windowType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            x = 12
+        }
+
+        sideTouchpadView = root
+        try {
+            wm.addView(root, sideParams)
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to add side Gear VR touchpad view", e)
+        }
+
+        updateSideTouchpadViews()
+    }
+
+    private fun TemporarilyEnsureGestureReady() {
+        temporarilyEnsurePassThroughForGesture()
+    }
+
+    private fun updateSideTouchpadViews() {
+        val root = sideTouchpadView as? FrameLayout ?: return
+        val expanded = root.getChildAt(0) as? LinearLayout ?: return
+        val collapsed = root.getChildAt(1) as? LinearLayout ?: return
+
+        if (currentSettings.isTouchPeekMode || !currentSettings.gearVrTouchpadEnabled) {
+            root.visibility = View.GONE
+            return
+        }
+        root.visibility = View.VISIBLE
+
+        if (isSideTouchpadMinimized) {
+            expanded.visibility = View.GONE
+            collapsed.visibility = View.VISIBLE
+        } else {
+            expanded.visibility = View.VISIBLE
+            collapsed.visibility = View.GONE
+        }
+
+        val modeToggleBtn = expanded.getChildAt(2) as? TextView
+        modeToggleBtn?.text = if (currentSettings.touchpadSwipeScrolls) "📜 SCROLL" else "🎯 CURSOR"
+        (modeToggleBtn?.background as? GradientDrawable)?.setColor(
+            if (currentSettings.touchpadSwipeScrolls) Color.parseColor("#B388FF")
+            else Color.parseColor("#00E5FF")
+        )
     }
 
     private fun collapseHud() {
@@ -819,25 +1569,42 @@ class VrOverlayService : Service() {
         val splitText = expanded.getChildAt(6) as? TextView
         splitText?.text = "IPD ${(currentSettings.ipdOffset * 100).toInt()}"
 
-        // Update Touch mode
-        val touchText = expanded.getChildAt(9) as? TextView
-        if (currentSettings.touchPassThrough) {
-            touchText?.text = "TOUCH PASS"
-            touchText?.setTextColor(Color.parseColor("#00E676"))
-        } else {
-            touchText?.text = "VR CONTROLS"
-            touchText?.setTextColor(Color.parseColor("#FF9100"))
-        }
+        // Update AR Toggle & Hand AI Toggle labels
+        val arBtn = expanded.getChildAt(11) as? TextView
+        arBtn?.text = if (currentSettings.arPassthroughEnabled) "🌐 AR ON" else "🌐 AR"
+        arBtn?.setTextColor(
+            if (currentSettings.arPassthroughEnabled) Color.parseColor("#00E676")
+            else Color.parseColor("#B388FF")
+        )
+
+        val handBtn = expanded.getChildAt(12) as? TextView
+        handBtn?.text = if (currentSettings.handTrackingEnabled) "🖐️ HAND ON" else "🖐️ HAND"
+        handBtn?.setTextColor(
+            if (currentSettings.handTrackingEnabled) Color.parseColor("#00E676")
+            else Color.parseColor("#80F2FF")
+        )
+
+        val cinemaBtn = expanded.getChildAt(13) as? TextView
+        cinemaBtn?.text = if (currentSettings.cinemaScreenEnabled) "🎬 CURVED" else "🎬 FLAT"
+        cinemaBtn?.setTextColor(
+            if (currentSettings.cinemaScreenEnabled) Color.parseColor("#00E5FF")
+            else Color.parseColor("#94A3B8")
+        )
     }
 
     /**
      * Toggles in-VR Lens Distortion and Optical Tuning Modal with Focal Length and Coefficients.
      */
     private fun toggleInVrOpticsModal() {
+        val (wm, windowType) = resolveOverlayWindowManagerAndType()
         if (floatingOpticsModal != null) {
             try {
-                windowManager.removeView(floatingOpticsModal)
-            } catch (_: Exception) {}
+                wm.removeView(floatingOpticsModal)
+            } catch (_: Exception) {
+                try {
+                    defaultWindowManager.removeView(floatingOpticsModal)
+                } catch (_: Exception) {}
+            }
             floatingOpticsModal = null
             return
         }
@@ -881,7 +1648,7 @@ class VrOverlayService : Service() {
         headerRow.addView(closeIcon)
         container.addView(headerRow)
 
-        // 1. Focal Length Slider (30mm to 65mm)
+        // 1. Focal Length Slider (25mm to 65mm)
         val focalLabel = TextView(this).apply {
             text = "Focal Length: ${currentSettings.focalLength.toInt()} mm (Gear VR = 42mm)"
             setTextColor(Color.WHITE)
@@ -981,6 +1748,31 @@ class VrOverlayService : Service() {
         container.addView(gapLabel)
         container.addView(gapSeek)
 
+        // 5. Curved Cinema Screen Curvature
+        val cinemaCurveLabel = TextView(this).apply {
+            text = "Curved Cinema Screen Arc: ${if (currentSettings.cinemaScreenEnabled) "${(currentSettings.cinemaCurvature * 100).toInt()}%" else "Flat (0%)"}"
+            setTextColor(Color.parseColor("#00E5FF"))
+            textSize = 11f
+            setPadding(0, 8, 0, 0)
+        }
+        val cinemaCurveSeek = SeekBar(this).apply {
+            max = 80
+            progress = if (currentSettings.cinemaScreenEnabled) (currentSettings.cinemaCurvature * 100).toInt().coerceIn(0, 80) else 0
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    if (fromUser) {
+                        val curve = progress / 100f
+                        cinemaCurveLabel.text = "Curved Cinema Screen Arc: ${if (progress > 1) "${progress}%" else "Flat (0%)"}"
+                        prefsRepo.setCinemaCurvature(curve)
+                    }
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        container.addView(cinemaCurveLabel)
+        container.addView(cinemaCurveSeek)
+
         // Done button
         val doneBtn = TextView(this).apply {
             text = "Done & Apply"
@@ -1010,7 +1802,7 @@ class VrOverlayService : Service() {
         val modalParams = WindowManager.LayoutParams(
             720,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            windowType,
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -1019,7 +1811,7 @@ class VrOverlayService : Service() {
 
         floatingOpticsModal = container
         try {
-            windowManager.addView(container, modalParams)
+            wm.addView(container, modalParams)
         } catch (e: Exception) {
             Log.e(tag, "Failed to show optics modal", e)
         }
@@ -1038,25 +1830,49 @@ class VrOverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (instance === this) {
+            instance = null
+        }
         _isOverlayRunning.value = false
+        VrFrameHolder.onFrameUpdated = null
+        voiceControlManager?.release()
+        voiceControlManager = null
+        cameraHandController?.release()
+        cameraHandController = null
+        touchpadDriver?.stop()
+        touchpadDriver = null
+        headTracker?.stop()
+        headTracker = null
+
+        val wm = activeWindowManager ?: defaultWindowManager
 
         try {
-            floatingOpticsModal?.let { windowManager.removeView(it) }
+            floatingOpticsModal?.let { wm.removeView(it) }
             floatingOpticsModal = null
         } catch (_: Exception) {}
 
         try {
-            floatingHudView?.let { windowManager.removeView(it) }
+            sideTouchpadView?.let { wm.removeView(it) }
+            sideTouchpadView = null
+        } catch (_: Exception) {}
+
+        try {
+            floatingHudView?.let { wm.removeView(it) }
             floatingHudView = null
         } catch (_: Exception) {}
 
         try {
-            glSurfaceView?.let { windowManager.removeView(it) }
+            glSurfaceView?.let { wm.removeView(it) }
             glSurfaceView = null
         } catch (_: Exception) {}
 
         sbsRenderer?.release()
         sbsRenderer = null
+
+        try {
+            projectionImageReader?.close()
+        } catch (_: Exception) {}
+        projectionImageReader = null
 
         surface?.release()
         surface = null
@@ -1074,6 +1890,10 @@ class VrOverlayService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
+        @Volatile
+        var instance: VrOverlayService? = null
+            private set
+
         const val CHANNEL_ID = "vr_sbs_overlay_channel"
         const val NOTIFICATION_ID = 4040
 
@@ -1086,6 +1906,7 @@ class VrOverlayService : Service() {
         const val ACTION_SPLIT_OUT = "com.example.action.SPLIT_OUT"
         const val ACTION_TOGGLE_TOUCH = "com.example.action.TOGGLE_TOUCH"
         const val ACTION_TOGGLE_TOUCH_PEEK = "com.example.action.TOGGLE_TOUCH_PEEK"
+        const val ACTION_CLICK_CURSOR = "com.example.action.CLICK_CURSOR"
         const val ACTION_RECENTER = "com.example.action.RECENTER"
 
         const val EXTRA_RESULT_CODE = "extra_result_code"

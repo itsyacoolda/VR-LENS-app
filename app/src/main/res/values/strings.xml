@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">VR Lens SBS</string>
+    <string name="vr_accessibility_label">VR Lens SBS Touch &amp; Gear VR Touchpad</string>
+    <string name="vr_accessibility_description">Enables trusted touch pass-through for the SBS VR overlay without untrusted touch blocking, and allows the Gear VR side touchpad and buttons to click, scroll, and navigate underlying apps in VR.</string>
 </resources>

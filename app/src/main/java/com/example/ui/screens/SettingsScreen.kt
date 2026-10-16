@@ -22,7 +22,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.BrightnessMedium
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.FilterCenterFocus
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tune
@@ -69,10 +71,12 @@ fun SettingsScreen(
     settings: VrSettings,
     onSettingsChanged: (VrSettings) -> Unit,
     onPresetSelected: (String) -> Unit,
+    onRecenterHead: () -> Unit = {},
     onNavigateBack: () -> Unit
 ) {
     val presets = listOf(
         VrSettings.PRESET_GEAR_VR_S23,
+        VrSettings.PRESET_CURVED_CINEMA,
         VrSettings.PRESET_CARDBOARD,
         VrSettings.PRESET_DAYDREAM,
         VrSettings.PRESET_CINEMA_FLAT,
@@ -168,6 +172,284 @@ fun SettingsScreen(
             }
 
             Spacer(modifier = Modifier.height(20.dp))
+
+            // Curved Cinema Screen Display Mode Card
+            SettingGroupCard(title = "CURVED CINEMA SCREEN DISPLAY MODE", icon = Icons.Default.Visibility) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Curved Cinema Screen Projection",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = VrTextPrimary,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "Wraps the SBS video feed along a concave cylindrical theater arc",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = VrTextSecondary,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Switch(
+                        checked = settings.cinemaScreenEnabled,
+                        onCheckedChange = { enabled ->
+                            val newCurve = if (enabled && settings.cinemaCurvature < 0.05f) 0.32f else settings.cinemaCurvature
+                            onSettingsChanged(
+                                settings.copy(
+                                    cinemaScreenEnabled = enabled,
+                                    cinemaCurvature = newCurve,
+                                    presetName = VrSettings.PRESET_CUSTOM
+                                )
+                            )
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.Black,
+                            checkedTrackColor = VrCyanNeon,
+                            uncheckedTrackColor = Color(0xFF334155)
+                        )
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                SliderItem(
+                    label = "Cinema Screen Curvature Intensity",
+                    valueText = "${(settings.cinemaCurvature * 100).toInt()}%",
+                    value = settings.cinemaCurvature,
+                    range = 0.0f..0.80f,
+                    onValueChange = {
+                        onSettingsChanged(
+                            settings.copy(
+                                cinemaScreenEnabled = it > 0.01f,
+                                cinemaCurvature = it,
+                                presetName = VrSettings.PRESET_CUSTOM
+                            )
+                        )
+                    }
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Dynamic Theater Ambilight Glow",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = VrTextPrimary,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = "Projects ambient edge lighting from the video into the dark theater surround",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = VrTextSecondary,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Switch(
+                        checked = settings.cinemaAmbientGlow,
+                        onCheckedChange = { onSettingsChanged(settings.copy(cinemaAmbientGlow = it)) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.Black,
+                            checkedTrackColor = VrVioletNeon,
+                            uncheckedTrackColor = Color(0xFF334155)
+                        )
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Head Tracking & Sensors Card
+            SettingGroupCard(title = "HEAD TRACKING & SENSORS (3DoF)", icon = Icons.Default.Explore) {
+                // Master Enable Toggle
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Gyroscope & Accelerometer Tracking",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = VrTextPrimary,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            text = settings.headTrackingSensorName,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = VrCyanNeon,
+                            fontSize = 11.sp
+                        )
+                    }
+                    Switch(
+                        checked = settings.headTrackingEnabled,
+                        onCheckedChange = { onSettingsChanged(settings.copy(headTrackingEnabled = it)) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.Black,
+                            checkedTrackColor = VrCyanNeon,
+                            uncheckedTrackColor = Color(0xFF334155)
+                        )
+                    )
+                }
+
+                if (settings.headTrackingEnabled) {
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Live Telemetry Badges
+                    val yawDeg = (settings.headYaw * 180f / Math.PI.toFloat()).toInt()
+                    val pitchDeg = (settings.headPitch * 180f / Math.PI.toFloat()).toInt()
+                    val rollDeg = (settings.headRoll * 180f / Math.PI.toFloat()).toInt()
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF0F172A))
+                            .padding(8.dp),
+                        horizontalArrangement = Arrangement.SpaceAround
+                    ) {
+                        Text("YAW: ${yawDeg}°", color = VrCyanNeon, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text("PITCH: ${pitchDeg}°", color = VrVioletNeon, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text("ROLL: ${rollDeg}°", color = VrGreenNeon, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Recenter Forward View Button
+                    Button(
+                        onClick = onRecenterHead,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF132A3E)),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.MyLocation,
+                            contentDescription = "Recenter",
+                            tint = VrCyanNeon,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "🎯 Recenter Forward View",
+                            color = VrCyanNeon,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Mode Selection
+                    Text(
+                        text = "Head Tracking Mode",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = VrTextPrimary,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        val modes = listOf(
+                            VrSettings.HEAD_TRACKING_WORLD_LOCKED to "World-Locked",
+                            VrSettings.HEAD_TRACKING_GAZE_AIM to "Gaze Aim",
+                            VrSettings.HEAD_TRACKING_CINEMA_CANVAS to "Panoramic"
+                        )
+                        modes.forEach { (modeVal, label) ->
+                            val selected = settings.headTrackingMode == modeVal
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (selected) VrCyanNeon else Color(0xFF0F172A))
+                                    .border(1.dp, if (selected) VrCyanNeon else VrCardBorder, RoundedCornerShape(8.dp))
+                                    .clickable { onSettingsChanged(settings.copy(headTrackingMode = modeVal)) }
+                                    .padding(vertical = 8.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = label,
+                                    color = if (selected) Color.Black else VrTextSecondary,
+                                    fontSize = 11.sp,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    SliderItem(
+                        label = "Head Movement Sensitivity",
+                        valueText = "${"%.1f".format(settings.headTrackingSensitivity)}x",
+                        value = settings.headTrackingSensitivity,
+                        range = 0.3f..2.5f,
+                        onValueChange = { onSettingsChanged(settings.copy(headTrackingSensitivity = it)) }
+                    )
+
+                    SliderItem(
+                        label = "Comfort Smoothing & Damping",
+                        valueText = "${(settings.headTrackingSmoothing * 100).toInt()}%",
+                        value = settings.headTrackingSmoothing,
+                        range = 0.08f..0.50f,
+                        onValueChange = { onSettingsChanged(settings.copy(headTrackingSmoothing = it)) }
+                    )
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (settings.headTrackingInvertYaw) Color(0xFF1A2A38) else Color(0xFF0F172A))
+                                .border(1.dp, if (settings.headTrackingInvertYaw) VrCyanNeon else VrCardBorder, RoundedCornerShape(8.dp))
+                                .clickable { onSettingsChanged(settings.copy(headTrackingInvertYaw = !settings.headTrackingInvertYaw)) }
+                                .padding(8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "Invert Yaw (Left/Right)",
+                                color = if (settings.headTrackingInvertYaw) VrCyanNeon else VrTextSecondary,
+                                fontSize = 10.5.sp,
+                                fontWeight = if (settings.headTrackingInvertYaw) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (settings.headTrackingInvertPitch) Color(0xFF1A2A38) else Color(0xFF0F172A))
+                                .border(1.dp, if (settings.headTrackingInvertPitch) VrCyanNeon else VrCardBorder, RoundedCornerShape(8.dp))
+                                .clickable { onSettingsChanged(settings.copy(headTrackingInvertPitch = !settings.headTrackingInvertPitch)) }
+                                .padding(8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "Invert Pitch (Up/Down)",
+                                color = if (settings.headTrackingInvertPitch) VrCyanNeon else VrTextSecondary,
+                                fontSize = 10.5.sp,
+                                fontWeight = if (settings.headTrackingInvertPitch) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
 
             // Optical Alignment Card
             SettingGroupCard(title = "OPTICAL ALIGNMENT (IPD & FOV)", icon = Icons.Default.FilterCenterFocus) {
